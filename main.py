@@ -2,8 +2,9 @@
 
 Reads /input/history.ndjson (+ task.json), writes /output/forecast.json.
 Stdlib only, no network, no clock, no randomness: a pure function of /input.
-Design: wide persistence kernel (span 10, named sum 0.65 per place), 28-day
-expiry scaling from details.created, top10 by expected place.
+Design: wide persistence kernel (span 11, named 0.65 per place), 28-day
+expiry scaling from details.created, Top Trending games discounted x0.9
+(measured mean-reversion), top10 by expected place.
 """
 import json
 import os
@@ -84,8 +85,12 @@ def build_forecast(input_dir):
     rank_of = {g["universe_id"]: g["rank"] for g in chart}
     details = history[-1].get("details")
     expiry = _expiry_fractions(chart, details, window_from, window_hours)
+    trending_ids = set()
+    for g in history[-1].get("top_trending") or []:
+        if isinstance(g.get("universe_id"), int):
+            trending_ids.add(g["universe_id"])
 
-    span = 10
+    span = 11
     named_total = 0.65
     cap = 0.25
 
@@ -96,12 +101,18 @@ def build_forecast(input_dir):
         for g in chart:
             r = g["rank"]
             if abs(r - k) <= span:
-                weights[g["universe_id"]] = 1.0 / (1.0 + abs(r - k))
+                w = 1.0 / (1.0 + abs(r - k))
+                if g["universe_id"] in trending_ids:
+                    w *= 0.9
+                weights[g["universe_id"]] = w
         if k >= 8:
             for g in chart:
                 r = g["rank"]
                 if 21 <= r <= 30 and g["universe_id"] not in weights:
-                    weights[g["universe_id"]] = 1.0 / (1.0 + abs(r - k) + 5.0)
+                    w = 1.0 / (1.0 + abs(r - k) + 5.0)
+                    if g["universe_id"] in trending_ids:
+                        w *= 0.9
+                    weights[g["universe_id"]] = w
         scaled = {}
         for uid, w in weights.items():
             scaled[uid] = w * expiry.get(uid, 1.0)
