@@ -39,7 +39,14 @@ def _close_chart(last_read):
         if isinstance(g.get("universe_id"), int) and isinstance(g.get("rank"), int)
     ]
     games.sort(key=lambda g: g["rank"])
-    return games
+    unique = []
+    seen_ids = set()
+    for g in games:
+        if g["universe_id"] in seen_ids:
+            continue
+        seen_ids.add(g["universe_id"])
+        unique.append(g)
+    return unique
 
 
 def _expiry_fractions(games, details, window_from, window_hours):
@@ -85,10 +92,13 @@ def build_forecast(input_dir):
     rank_of = {g["universe_id"]: g["rank"] for g in chart}
     details = history[-1].get("details")
     expiry = _expiry_fractions(chart, details, window_from, window_hours)
+    trend_entries = history[-1].get("top_trending") or []
+    if isinstance(trend_entries, dict):
+        trend_entries = list(trend_entries.values())
     trending_ids = set()
-    for g in history[-1].get("top_trending") or []:
-        if isinstance(g.get("universe_id"), int):
-            trending_ids.add(g["universe_id"])
+    for entry in trend_entries:
+        if isinstance(entry, dict) and isinstance(entry.get("universe_id"), int):
+            trending_ids.add(entry["universe_id"])
 
     span = 11
     named_total = 0.65
