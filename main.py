@@ -1,190 +1,256 @@
-"""Roblox Up-and-Coming top-10 forecaster - V1 pure wide persistence kernel.
+"""Roblox Up-and-Coming top-10 forecast.
 
-Reads /input/history.ndjson (+ task.json), writes /output/forecast.json.
-Stdlib only, no network, no clock, no randomness: a pure function of /input.
-Design: wide persistence kernel (span 11, named 0.65 per place), 28-day
-expiry scaling from details.created, Top Trending games discounted x0.9
-(measured mean-reversion), top10 by expected place.
+Wide persistence kernel over the close chart: each place's named mass is
+spread over nearby close ranks with a 1 / (1 + distance) kernel, named share
+0.65, a small discount for games on Top Trending, and 28-day expiry scaling
+from each game's creation time. Deterministic, standard library only.
 """
+
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
-def _parse_time(s):
-    if not s:
+NAMED_TOTAL = 0.65
+MAX_P = 0.25
+SPAN = 11
+TRENDING_FACTOR = 0.9
+EXPIRY_DAYS = 28
+BENCH_RANKS = range(21, 31)
+
+
+def parse_ts(value):
+    """Parse an ISO 8601 timestamp (or epoch number) to an aware datetime."""
+    if value is None:
         return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
-def _load_history(input_dir):
+def to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_history(input_dir):
+    """Read history.ndjson, oldest first, skipping unusable lines."""
     path = os.path.join(input_dir, "history.ndjson")
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+    reads = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
             line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if record.get("ok") is False:
+                continue
+            moment = parse_ts(record.get("at"))
+            if moment is None:
+                continue
+            reads.append((moment, record))
+    reads.sort(key=lambda item: item[0])
+    return reads
 
 
-def _close_chart(last_read):
-    games = last_read.get("up_and_coming") or []
-    games = [g for g in games if not g.get("sponsored")]
-    games = [
-        g for g in games
-        if isinstance(g.get("universe_id"), int) and isinstance(g.get("rank"), int)
-    ]
-    games.sort(key=lambda g: g["rank"])
-    unique = []
-    seen_ids = set()
-    for g in games:
-        if g["universe_id"] in seen_ids:
+def is_sponsored(game):
+    for key in ("sponsored", "is_sponsored", "sponsored_content", "ad"):
+        if game.get(key):
+            return True
+    return False
+
+
+def chart_games(record):
+    """Deduplicated close-chart games, sorted by rank then universe id."""
+    games = []
+    seen = set()
+    for game in record.get("up_and_coming") or []:
+        if not isinstance(game, dict):
             continue
-        seen_ids.add(g["universe_id"])
-        unique.append(g)
-    return unique
-
-
-def _expiry_fractions(games, details, window_from, window_hours):
-    """Fraction of window hours before each game's 28-day expiry (1.0 if unknown)."""
-    frac = {}
-    if not isinstance(details, dict):
-        return frac
-    for g in games:
-        uid = g["universe_id"]
-        d = details.get(str(uid)) or details.get(uid)
-        if not isinstance(d, dict):
+        uid = to_int(game.get("universe_id"))
+        if uid is None or uid in seen:
             continue
-        created = _parse_time(d.get("created"))
-        if created is None or window_from is None:
+        if is_sponsored(game):
             continue
-        expiry = created + timedelta(days=28)
-        hours_left = (expiry - window_from).total_seconds() / 3600.0
-        frac[uid] = max(0.0, min(1.0, hours_left / float(window_hours)))
-    return frac
+        rank = to_int(game.get("rank"))
+        if rank is None:
+            continue
+        seen.add(uid)
+        games.append({"universe_id": uid, "rank": rank,
+                      "playing": game.get("playing")})
+    games.sort(key=lambda item: (item["rank"], item["universe_id"]))
+    return games
 
 
-def build_forecast(input_dir):
-    with open(os.path.join(input_dir, "task.json"), "r", encoding="utf-8") as f:
-        task = json.load(f)
-    places = int(task.get("places", 10))
-    output_name = task.get("output", "forecast.json")
+def cap_and_normalize(weights):
+    """Scale weights to NAMED_TOTAL with each share capped at MAX_P.
+
+    Water-filling: entries that would exceed the cap are pinned at the cap
+    and the remaining mass is shared among the rest in proportion to weight.
+    Returns a list of (universe_id, p) sorted by universe id.
+    """
+    result = {}
+    remaining = list(weights)
+    mass_left = NAMED_TOTAL
+    while remaining and mass_left > 0.0:
+        weight_sum = sum(weight for _, weight in remaining)
+        if weight_sum <= 0.0:
+            break
+        share = mass_left / weight_sum
+        capped = [(uid, w) for uid, w in remaining if w * share >= MAX_P]
+        if not capped:
+            for uid, weight in remaining:
+                result[uid] = weight * share
+            break
+        for uid, _weight in capped:
+            result[uid] = MAX_P
+            mass_left -= MAX_P
+        remaining = [(uid, w) for uid, w in remaining if w * share < MAX_P]
+    return sorted(result.items())
+
+
+def build_forecast(task, reads):
+    places = to_int(task.get("places")) or 10
     window = task.get("window") or {}
-    window_from = _parse_time(window.get("from"))
-    window_until = _parse_time(window.get("until"))
-    window_hours = 72
-    if window_from is not None and window_until is not None:
-        window_hours = max(
-            1, int(round((window_until - window_from).total_seconds() / 3600.0))
-        )
+    close_at, close_record = reads[-1]
+    win_from = parse_ts(window.get("from")) or close_at
+    win_until = parse_ts(window.get("until")) or (
+        win_from + timedelta(hours=72))
+    window_seconds = max((win_until - win_from).total_seconds(), 1.0)
 
-    history = _load_history(input_dir)
-    if not history:
-        raise ValueError("empty history")
-    chart = _close_chart(history[-1])
-    if not chart:
-        raise ValueError("empty close chart")
-    n_chart = len(chart)
-    rank_of = {g["universe_id"]: g["rank"] for g in chart}
-    details = history[-1].get("details")
-    expiry = _expiry_fractions(chart, details, window_from, window_hours)
-    trend_entries = history[-1].get("top_trending") or []
-    if isinstance(trend_entries, dict):
-        trend_entries = list(trend_entries.values())
-    trending_ids = set()
-    for entry in trend_entries:
-        if isinstance(entry, dict) and isinstance(entry.get("universe_id"), int):
-            trending_ids.add(entry["universe_id"])
+    games = chart_games(close_record)
+    close_rank = {game["universe_id"]: game["rank"] for game in games}
+    close_playing = {}
+    for game in games:
+        playing = game.get("playing")
+        close_playing[game["universe_id"]] = (
+            playing if isinstance(playing, (int, float)) else None)
 
-    span = 11
-    named_total = 0.65
-    cap = 0.25
+    trending = set()
+    for game in close_record.get("top_trending") or []:
+        if isinstance(game, dict):
+            uid = to_int(game.get("universe_id"))
+            if uid is not None:
+                trending.add(uid)
+
+    details_by_id = {}
+    details = close_record.get("details")
+    if isinstance(details, dict):
+        for key, info in details.items():
+            uid = to_int(key)
+            if uid is not None:
+                details_by_id[uid] = info
+
+    def expiry_fraction(uid):
+        info = details_by_id.get(uid)
+        if not isinstance(info, dict):
+            return 1.0
+        created = parse_ts(info.get("created"))
+        if created is None:
+            return 1.0
+        expiry = created + timedelta(days=EXPIRY_DAYS)
+        if expiry <= win_from:
+            return 0.0
+        if expiry >= win_until:
+            return 1.0
+        return (expiry - win_from).total_seconds() / window_seconds
 
     probabilities = []
-    place_mass = {}
-    for k in range(1, places + 1):
-        weights = {}
-        for g in chart:
-            r = g["rank"]
-            if abs(r - k) <= span:
-                w = 1.0 / (1.0 + abs(r - k))
-                if g["universe_id"] in trending_ids:
-                    w *= 0.9
-                weights[g["universe_id"]] = w
-        if k >= 8:
-            for g in chart:
-                r = g["rank"]
-                if 21 <= r <= 30 and g["universe_id"] not in weights:
-                    w = 1.0 / (1.0 + abs(r - k) + 5.0)
-                    if g["universe_id"] in trending_ids:
-                        w *= 0.9
-                    weights[g["universe_id"]] = w
-        scaled = {}
-        for uid, w in weights.items():
-            scaled[uid] = w * expiry.get(uid, 1.0)
-        total = sum(scaled.values())
-        if total <= 0:
-            scaled = dict(weights)
-            total = sum(scaled.values())
-        rows = {}
-        for uid, w in scaled.items():
-            rows[uid] = min(named_total * w / total, cap)
-        s = sum(rows.values())
-        if 0 < s < named_total:
-            for uid in rows:
-                rows[uid] = rows[uid] * named_total / s
-        place_mass[k] = rows
-        for uid in sorted(rows):
-            probabilities.append({"universe_id": uid, "place": k, "p": rows[uid]})
+    expected_place = {}
+    for place in range(1, places + 1):
+        weights = []
+        for game in games:
+            uid = game["universe_id"]
+            rank = game["rank"]
+            distance = abs(rank - place)
+            in_span = distance <= SPAN
+            in_bench = place >= 8 and rank in BENCH_RANKS
+            if not in_span and not in_bench:
+                continue
+            weight = 1.0 / (1.0 + distance)
+            if uid in trending:
+                weight *= TRENDING_FACTOR
+            weight *= expiry_fraction(uid)
+            if weight <= 0.0:
+                continue
+            weights.append((uid, weight))
+        if not weights:
+            continue
+        for uid, prob in cap_and_normalize(weights):
+            if prob <= 0.0:
+                continue
+            probabilities.append(
+                {"universe_id": uid, "place": place, "p": prob})
+            expected_place[uid] = expected_place.get(uid, 0.0) + place * prob
 
-    expected = {}
-    for uid in rank_of:
-        exp_place = 0.0
-        for k in range(1, places + 1):
-            rows = place_mass[k]
-            if uid in rows:
-                p = rows[uid]
-            else:
-                unnamed = (1.0 - sum(rows.values())) / max(1, n_chart - len(rows))
-                p = unnamed
-            exp_place += k * p
-        expected[uid] = exp_place
-    top10 = [uid for uid, _ in sorted(expected.items(), key=lambda kv: (kv[1], kv[0]))[:places]]
-    if len(top10) < places:
-        # Edge case: close chart holds fewer than `places` games. Pad with
-        # games seen on earlier reads (most recent first) so top10 stays
-        # exactly `places` distinct ids. Never triggers on a normal chart
-        # (90+ games), but keeps the output valid on degenerate input.
-        seen = set(top10)
-        for read in reversed(history[:-1]):
-            for g in _close_chart(read):
-                uid = g["universe_id"]
-                if uid not in seen:
-                    seen.add(uid)
-                    top10.append(uid)
-                    if len(top10) >= places:
-                        break
-            if len(top10) >= places:
+    probabilities.sort(key=lambda row: (row["place"], row["universe_id"]))
+
+    # Rank by conditional expected place: raw expected place divided by
+    # the game's total named mass. Dividing matters because a bench game
+    # named at only a few places with tiny probabilities would otherwise
+    # look like it belongs at the top. Tie-break by close rank, then by
+    # higher close playing count.
+    mass = {}
+    for row in probabilities:
+        mass[row["universe_id"]] = mass.get(row["universe_id"], 0.0) + row["p"]
+    ranked = sorted(
+        expected_place,
+        key=lambda uid: (
+            expected_place[uid] / mass.get(uid, 1.0),
+            close_rank.get(uid, 10 ** 9),
+            -(close_playing.get(uid) or 0),
+        ),
+    )
+    top10 = list(ranked[:10])
+    if len(top10) < 10:
+        chosen = set(top10)
+        for _moment, record in reversed(reads[:-1]):
+            for game in chart_games(record):
+                uid = game["universe_id"]
+                if uid in chosen:
+                    continue
+                chosen.add(uid)
+                top10.append(uid)
+                if len(top10) >= 10:
+                    break
+            if len(top10) >= 10:
                 break
-    top10 = top10[:places]
-
-    probabilities.sort(key=lambda r: (r["place"], r["universe_id"]))
-    return {"probabilities": probabilities, "top10": top10}, output_name
+    return {"probabilities": probabilities, "top10": top10[:10]}
 
 
 def main():
     input_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
     output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    forecast, output_name = build_forecast(input_dir)
+    with open(os.path.join(input_dir, "task.json"), "r", encoding="utf-8") as handle:
+        task = json.load(handle)
+    reads = load_history(input_dir)
+    if not reads:
+        raise SystemExit("no usable reads in history.ndjson")
+    forecast = build_forecast(task, reads)
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, output_name)
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(json.dumps(forecast, sort_keys=True, separators=(",", ":")))
-        f.write("\n")
+    out_name = task.get("output") or "forecast.json"
+    out_path = os.path.join(output_dir, out_name)
+    with open(out_path, "w", encoding="utf-8") as handle:
+        json.dump(forecast, handle, separators=(",", ":"))
+        handle.write("\n")
 
 
 if __name__ == "__main__":
