@@ -17,10 +17,19 @@ challengers: across all 5 backtest folds, rank 11-30 games that climbed
 >=3 ranks in 24h entered the window top 10 ~36% of the time, flat games
 ~14%, games that fell >=3 only ~5%.
 
+The tilt multiplies each challenger's kernel weight BEFORE the per-place
+cap-and-normalize, so it shifts relative weights between games at the
+same place without changing any place's named total (0.65) or cap (0.25).
+
 Backtest (same 3 folds + 2 holdout folds as V1/V2, same harness):
 V1  selection -41.6303  holdout -38.2264
 V3  selection -41.3603  holdout -37.9823  (+0.27 / +0.24, 4 of 5 folds up)
 """
+
+import json
+import math
+import os
+from datetime import datetime, timedelta, timezone
 
 import json
 import math
@@ -134,6 +143,11 @@ def climb_rates(reads):
     brand-new chart entrant (NEW_ENTRANT_CLIMB/day).
     """
     close_at, close_record = reads[-1]
+    close_rank = {game["universe_id"]: game["rank"]
+                  for game in chart_games(close_record)}
+    if len(reads) < 2:
+        # No earlier read to measure movement against: no tilt.
+        return {uid: 0.0 for uid in close_rank}
     target = close_at - timedelta(hours=LOOKBACK_HOURS)
     ref = None
     for moment, record in reads[:-1]:
@@ -147,8 +161,6 @@ def climb_rates(reads):
     hours = max((close_at - ref_at).total_seconds() / 3600.0, 1.0)
     ref_rank = {game["universe_id"]: game["rank"]
                 for game in chart_games(ref_record)}
-    close_rank = {game["universe_id"]: game["rank"]
-                  for game in chart_games(close_record)}
     rates = {}
     for uid, rank in close_rank.items():
         old = ref_rank.get(uid)
