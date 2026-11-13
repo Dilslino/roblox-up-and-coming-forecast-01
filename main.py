@@ -186,6 +186,45 @@ def cap_and_normalize(weights):
     return sorted(result.items())
 
 
+def select_top10(probabilities, expected_place, close_rank, close_playing,
+                 reads):
+    """Pick the top 10 by conditional expected place.
+
+    A game's conditional expected place is its raw expected place divided
+    by its total named mass: dividing matters because a bench game named
+    at only a few places with tiny probabilities would otherwise look
+    like it belongs at the top. Ties break by close rank, then by higher
+    close playing count. If fewer than 10 games were named at all, fill
+    the rest from the most recent earlier reads, newest first.
+    """
+    mass = {}
+    for row in probabilities:
+        mass[row["universe_id"]] = mass.get(row["universe_id"], 0.0) + row["p"]
+    ranked = sorted(
+        expected_place,
+        key=lambda uid: (
+            expected_place[uid] / mass.get(uid, 1.0),
+            close_rank.get(uid, 10 ** 9),
+            -(close_playing.get(uid) or 0),
+        ),
+    )
+    top10 = list(ranked[:10])
+    if len(top10) < 10:
+        chosen = set(top10)
+        for _moment, record in reversed(reads[:-1]):
+            for game in chart_games(record):
+                uid = game["universe_id"]
+                if uid in chosen:
+                    continue
+                chosen.add(uid)
+                top10.append(uid)
+                if len(top10) >= 10:
+                    break
+            if len(top10) >= 10:
+                break
+    return top10[:10]
+
+
 def build_forecast(task, reads):
     places = to_int(task.get("places")) or 10
     window = task.get("window") or {}
@@ -279,38 +318,9 @@ def build_forecast(task, reads):
             expected_place[uid] = expected_place.get(uid, 0.0) + place * prob
 
     probabilities.sort(key=lambda row: (row["place"], row["universe_id"]))
-
-    # Rank by conditional expected place: raw expected place divided by
-    # the game's total named mass. Dividing matters because a bench game
-    # named at only a few places with tiny probabilities would otherwise
-    # look like it belongs at the top. Tie-break by close rank, then by
-    # higher close playing count.
-    mass = {}
-    for row in probabilities:
-        mass[row["universe_id"]] = mass.get(row["universe_id"], 0.0) + row["p"]
-    ranked = sorted(
-        expected_place,
-        key=lambda uid: (
-            expected_place[uid] / mass.get(uid, 1.0),
-            close_rank.get(uid, 10 ** 9),
-            -(close_playing.get(uid) or 0),
-        ),
-    )
-    top10 = list(ranked[:10])
-    if len(top10) < 10:
-        chosen = set(top10)
-        for _moment, record in reversed(reads[:-1]):
-            for game in chart_games(record):
-                uid = game["universe_id"]
-                if uid in chosen:
-                    continue
-                chosen.add(uid)
-                top10.append(uid)
-                if len(top10) >= 10:
-                    break
-            if len(top10) >= 10:
-                break
-    return {"probabilities": probabilities, "top10": top10[:10]}
+    top10 = select_top10(probabilities, expected_place, close_rank,
+                         close_playing, reads)
+    return {"probabilities": probabilities, "top10": top10}
 
 
 def main():
