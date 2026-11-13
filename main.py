@@ -238,27 +238,37 @@ def build_forecast(task, reads):
         clipped = max(CLIMB_CLIP[0], min(CLIMB_CLIP[1], rate))
         tilt[uid] = math.exp(BETA * clipped)
 
+    def game_weight(game, place):
+        """Kernel weight of one game at one place (0 if it is not named).
+
+        Base is V1's 1 / (1 + distance) kernel over the close rank, with
+        the Top Trending discount and the 28-day expiry scaling. The V3
+        momentum tilt multiplies the weight of challengers (ranks 11-30)
+        only; the close top 10 and the bench are left exactly as in V1.
+        """
+        uid = game["universe_id"]
+        rank = game["rank"]
+        distance = abs(rank - place)
+        in_span = distance <= SPAN
+        in_bench = place >= 8 and rank in BENCH_RANKS
+        if not in_span and not in_bench:
+            return 0.0
+        weight = 1.0 / (1.0 + distance)
+        if uid in trending:
+            weight *= TRENDING_FACTOR
+        weight *= expiry_fraction(uid)
+        if TILT_LO <= rank <= TILT_HI:
+            weight *= tilt.get(uid, 1.0)
+        return weight
+
     probabilities = []
     expected_place = {}
     for place in range(1, places + 1):
         weights = []
         for game in games:
-            uid = game["universe_id"]
-            rank = game["rank"]
-            distance = abs(rank - place)
-            in_span = distance <= SPAN
-            in_bench = place >= 8 and rank in BENCH_RANKS
-            if not in_span and not in_bench:
-                continue
-            weight = 1.0 / (1.0 + distance)
-            if uid in trending:
-                weight *= TRENDING_FACTOR
-            weight *= expiry_fraction(uid)
-            if TILT_LO <= rank <= TILT_HI:
-                weight *= tilt.get(uid, 1.0)
-            if weight <= 0.0:
-                continue
-            weights.append((uid, weight))
+            weight = game_weight(game, place)
+            if weight > 0.0:
+                weights.append((game["universe_id"], weight))
         if not weights:
             continue
         for uid, prob in cap_and_normalize(weights):
